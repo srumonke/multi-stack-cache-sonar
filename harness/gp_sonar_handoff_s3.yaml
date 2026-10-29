@@ -1,0 +1,871 @@
+# Parallel build STAGES - each its own pod, its own toolchain image - handing
+# their build output to ONE sonar stage through S3, using Harness's built-in
+# SaveCacheS3 / RestoreCacheS3 steps.
+#
+# Why these steps and not the others, all three verified on this account:
+#
+#   SaveCacheS3 / RestoreCacheS3   WORKS. The provider-specific cache steps
+#                                  ("Save Cache to S3" in the step library).
+#                                  Many keys per stage, so N parallel producers
+#                                  -> 1 consumer is expressible.
+#
+#   SaveCache / RestoreCache       BLOCKED. The newer generic steps, with a
+#   (providerType: S3 | Harness)   providerType field. The YAML saves, but the
+#                                  run dies at stage init with
+#                                  "IllegalStateException: Unexpected value:
+#                                  SAVE_CACHE". Gated at account level for
+#                                  providerType S3 as well as Harness - it is
+#                                  not a connector or credential problem.
+#
+#   stage.spec.caching             WORKS but cannot express this shape: one
+#   (Cache Intelligence)           cache key per stage, so five parallel build
+#                                  stages produce five keys and the sonar stage
+#                                  can restore only one. See HANDOFF.md.
+#
+# Credentials: none. account.AWS_OIDC_S3_Connector_account assumes
+# arn:aws:iam::664418987337:role/Harness_IaCM_S3_Role-sk by OIDC web identity
+# ("Successfully assumed role with OIDC" in the step log), so there is no access
+# key to rotate and nothing to expire.
+#
+# Cache keys are written under handoff/<executionId>/, which the bucket's
+# expire-handoff-7d lifecycle rule cleans up - no cleanup step needed.
+pipeline:
+  name: GP Sonar Handoff S3 Parallel Stages
+  identifier: gp_sonar_handoff_s3
+  projectIdentifier: Kyriba
+  orgIdentifier: default
+  description: >-
+    Build stages run in parallel, each in its own pod and its own toolchain
+    image, and each saves only what SonarQube cannot regenerate to S3 under
+    handoff/<executionId>/. One sonar stage restores whatever arrived,
+    aggregates each stack's own sonar properties, and runs exactly one analysis
+    against a real SonarQube server. No build tool runs in that stage.
+  tags:
+    gp_demo: sonar_handoff
+  properties:
+    ci:
+      codebase:
+        repoName: gp-sonar-demo
+        build:
+          type: branch
+          spec:
+            branch: main
+  variables:
+    - name: GP_ENFORCEMENT
+      type: String
+      description: Same three-word contract as the rest of the golden path. warn keeps the build green while still reporting the real gate result.
+      required: false
+      value: <+input>.default(warn).allowedValues(off,warn,fail)
+    - name: GP_SONAR_PROJECT_KEY
+      type: String
+      required: false
+      value: <+input>.default(kyriba_gp_sonar_demo)
+    - name: GP_STACKS_ENABLED
+      type: String
+      description: auto, or a comma list such as "gradle,go", to prove that a stack which does not run is simply absent from the analysis rather than scanned empty.
+      required: false
+      value: <+input>.default(auto)
+    - name: GP_APP_ROOT
+      type: String
+      description: Repo-relative directory the services live under. This is the ONLY place the repo layout is declared - prepare emits working_directory relative to it and every downstream path derives from that. Use "." for services sitting at the repo root.
+      required: false
+      value: <+input>.default(application)
+  stages:
+    # ------------------------------------------------------------------
+    # 1. prepare - detect what this repo actually contains, once.
+    # ------------------------------------------------------------------
+    - stage:
+        name: prepare
+        identifier: prepare
+        type: CI
+        description: Detects the stacks present in the repo, emits one matrix per stack, plus the union list the sonar stage restores from.
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: detect services
+                  identifier: detect_services
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      GP_STACKS_ENABLED: <+pipeline.variables.GP_STACKS_ENABLED>
+                      GP_APP_ROOT: <+pipeline.variables.GP_APP_ROOT>
+                    command: |
+                      set -eu
+
+                      # The repo layout is declared once, here. Everything
+                      # downstream uses the working_directory this step emits,
+                      # so moving the services never means editing a build
+                      # stage or the sonar stage.
+                      case "${GP_APP_ROOT}" in
+                        ""|"."|"./") prefix="" ;;
+                        *)           prefix="${GP_APP_ROOT%/}/" ;;
+                      esac
+                      cd "/harness/${prefix}"
+                      echo "scanning for services under /harness/${prefix:-<repo root>}"
+
+                      # A stack is enabled when GP_STACKS_ENABLED is auto, or
+                      # when it is named in the comma list.
+                      enabled() {
+                        if [ "${GP_STACKS_ENABLED}" = "auto" ]; then
+                          return 0
+                        fi
+                        if printf '%s' ",${GP_STACKS_ENABLED}," | grep -q ",$1,"; then
+                          return 0
+                        fi
+                        return 1
+                      }
+
+                      gradle_svcs=""
+                      npm_svcs=""
+                      go_svcs=""
+
+                      for d in */ ; do
+                        svc="${d%/}"
+                        [ -d "$svc" ] || continue
+                        if [ -f "$svc/build.gradle" ] || [ -f "$svc/build.gradle.kts" ]; then
+                          if enabled gradle; then
+                            gradle_svcs="${gradle_svcs}${gradle_svcs:+ }$svc"
+                          fi
+                        elif [ -f "$svc/package.json" ]; then
+                          if enabled npm; then
+                            npm_svcs="${npm_svcs}${npm_svcs:+ }$svc"
+                          fi
+                        elif [ -f "$svc/go.mod" ]; then
+                          if enabled go; then
+                            go_svcs="${go_svcs}${go_svcs:+ }$svc"
+                          fi
+                        fi
+                      done
+
+                      # One matrix per stack, consumed by that stack's stage.
+                      # A matrix that expands to zero iterations is a hard
+                      # error during strategy expansion, and expansion happens
+                      # before any when-condition is evaluated - so never emit
+                      # an empty one. The sentinel cell is a no-op downstream.
+                      stack_matrix() {
+                        items=""
+                        for svc in "$@"; do
+                          items="${items}${items:+,}{\"service_name\":\"${svc}\",\"working_directory\":\"${prefix}${svc}\"}"
+                        done
+                        if [ -z "$items" ]; then
+                          items='{"service_name":"__none__","working_directory":"."}'
+                        fi
+                        printf '{"services":[%s]}' "$items"
+                      }
+
+                      gradle_matrix=$(stack_matrix $gradle_svcs)
+                      npm_matrix=$(stack_matrix $npm_svcs)
+                      go_matrix=$(stack_matrix $go_svcs)
+
+                      # The union list, consumed by the sonar stage's restore
+                      # matrix: the sonar stage asks for exactly the modules
+                      # that exist, so no hardcoded stack list appears
+                      # downstream of here.
+                      all=""
+                      add_all() {
+                        stack=$1
+                        shift
+                        for svc in "$@"; do
+                          all="${all}${all:+,}{\"stack\":\"${stack}\",\"service_name\":\"${svc}\"}"
+                        done
+                      }
+                      add_all gradle $gradle_svcs
+                      add_all npm $npm_svcs
+                      add_all go $go_svcs
+                      if [ -z "$all" ]; then
+                        all='{"stack":"__none__","service_name":"__none__"}'
+                      fi
+                      all_modules=$(printf '{"modules":[%s]}' "$all")
+
+                      gradle_detected=false
+                      npm_detected=false
+                      go_detected=false
+                      [ -n "$gradle_svcs" ] && gradle_detected=true
+                      [ -n "$npm_svcs" ] && npm_detected=true
+                      [ -n "$go_svcs" ] && go_detected=true
+
+                      module_count=0
+                      for svc in $gradle_svcs $npm_svcs $go_svcs; do
+                        module_count=$((module_count + 1))
+                      done
+
+                      echo "=== detection ==================================="
+                      echo "stacks enabled   : ${GP_STACKS_ENABLED}"
+                      echo "gradle services  : ${gradle_svcs:-<none>}"
+                      echo "npm services     : ${npm_svcs:-<none>}"
+                      echo "go services      : ${go_svcs:-<none>}"
+                      echo "modules total    : ${module_count}"
+                      echo "all_modules      : ${all_modules}"
+                      echo "================================================="
+                    outputVariables:
+                      - name: gradle_detected
+                      - name: npm_detected
+                      - name: go_detected
+                      - name: gradle_matrix
+                      - name: npm_matrix
+                      - name: go_matrix
+                      - name: all_modules
+                      - name: module_count
+
+    # ------------------------------------------------------------------
+    # 2. the build stages - PARALLEL, each in its own pod, each owning its
+    #    toolchain AND its own sonar configuration, each saving its payload
+    #    under its own cache key.
+    # ------------------------------------------------------------------
+    - parallel:
+        - stage:
+            name: gradle
+            identifier: gradle
+            type: CI
+            description: Real gradle build. Compiles, tests, produces a JaCoCo XML report and exports the resolved dependency jars, then saves all of it to S3.
+            spec:
+              cloneCodebase: true
+              caching:
+                enabled: false
+              platform:
+                os: Linux
+                arch: Amd64
+              runtime:
+                type: Cloud
+                spec: {}
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: gradle build and test
+                      identifier: gradle_build
+                      timeout: 25m
+                      spec:
+                        shell: Sh
+                        image: gradle:8.10-jdk21
+                        envVariables:
+                          GP_SERVICE_NAME: <+matrix.services.service_name>
+                          GP_WORKING_DIRECTORY: <+matrix.services.working_directory>
+                        command: |
+                          set -eu
+                          svc="${GP_SERVICE_NAME}"
+                          if [ "$svc" = "__none__" ]; then
+                            echo "gradle stack not enabled for this run - nothing to do"
+                            exit 0
+                          fi
+                          cd "/harness/${GP_WORKING_DIRECTORY}"
+
+                          echo "=== building ${svc} on pod $(hostname) ==="
+                          gradle --no-daemon --console=plain \
+                            classes testClasses test jacocoTestReport exportSonarLibs
+
+                          # Stage the payload: everything SonarQube's Java
+                          # analyzer needs and cannot regenerate on its own -
+                          # bytecode, test bytecode, the resolved classpath,
+                          # the coverage report and the test results.
+                          payload="/harness/.gp-handoff/gradle/${svc}"
+                          mkdir -p "$payload"
+                          cp -r build/classes/java/main "$payload/classes"
+                          cp -r build/classes/java/test "$payload/test-classes"
+                          cp -r build/sonar-libs "$payload/libs"
+                          cp -r build/test-results/test "$payload/test-results"
+                          cp build/reports/jacoco/test/jacocoTestReport.xml "$payload/jacoco.xml"
+                          printf '%s' "$svc" > "$payload/MODULE"
+
+                          # Provenance, so the sonar stage can prove these files
+                          # were produced in a different pod, earlier.
+                          {
+                            echo "stack=gradle"
+                            echo "service=${svc}"
+                            echo "pod=$(hostname)"
+                            echo "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                            echo "command=gradle classes testClasses test jacocoTestReport exportSonarLibs"
+                          } > "$payload/BUILT_BY"
+
+                          # The stack declares its OWN sonar configuration, so
+                          # adding a stack never means editing the sonar step.
+                          # The paths are absolute and valid in both stages:
+                          # RestoreCacheS3 puts the tree back at the same
+                          # /harness/.gp-handoff location it was saved from.
+                          {
+                            echo "sonar.sources=${GP_WORKING_DIRECTORY}/src/main/java"
+                            echo "sonar.tests=${GP_WORKING_DIRECTORY}/src/test/java"
+                            echo "sonar.test.inclusions=**/*Test.java"
+                            echo "sonar.java.source=21"
+                            echo "sonar.java.binaries=${payload}/classes"
+                            echo "sonar.java.test.binaries=${payload}/test-classes"
+                            echo "sonar.java.libraries=${payload}/libs/*.jar"
+                            echo "sonar.java.test.libraries=${payload}/libs/*.jar"
+                            echo "sonar.coverage.jacoco.xmlReportPaths=${payload}/jacoco.xml"
+                            echo "sonar.junit.reportPaths=${payload}/test-results"
+                          } > "$payload/sonar.contrib"
+
+                          echo "=== payload staged for handoff ==="
+                          du -sh "$payload"
+                          echo "=== class files produced ==="
+                          find "$payload/classes" "$payload/test-classes" -name '*.class' | sort
+                          echo "=== dependency jars exported for the analyzer classpath ==="
+                          find "$payload/libs" -name '*.jar' | sort
+                          echo "=== this stack's sonar contribution ==="
+                          cat "$payload/sonar.contrib"
+                  - step:
+                      type: SaveCacheS3
+                      name: save payload to s3
+                      identifier: save_gradle_payload
+                      timeout: 15m
+                      spec:
+                        connectorRef: account.AWS_OIDC_S3_Connector_account
+                        region: us-west-2
+                        bucket: gp-sonar-handoff-664418987337
+                        key: handoff/<+pipeline.executionId>/gradle/<+matrix.services.service_name>
+                        sourcePaths:
+                          - /harness/.gp-handoff/gradle/<+matrix.services.service_name>
+                        archiveFormat: Tar
+                        override: true
+                      when:
+                        stageStatus: Success
+                        condition: '<+matrix.services.service_name> != "__none__"'
+            strategy:
+              matrix:
+                services: <+json.list("services", <+pipeline.stages.prepare.spec.execution.steps.detect_services.output.outputVariables.gradle_matrix>)>
+                maxConcurrency: 2
+            when:
+              pipelineStatus: Success
+              condition: '<+pipeline.stages.prepare.spec.execution.steps.detect_services.output.outputVariables.gradle_detected> == "true"'
+
+        - stage:
+            name: npm
+            identifier: npm
+            type: CI
+            description: Real Node build. Produces an lcov report, then saves it to S3.
+            spec:
+              cloneCodebase: true
+              caching:
+                enabled: false
+              platform:
+                os: Linux
+                arch: Amd64
+              runtime:
+                type: Cloud
+                spec: {}
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: npm test
+                      identifier: npm_test
+                      timeout: 15m
+                      spec:
+                        shell: Sh
+                        image: node:22-alpine
+                        envVariables:
+                          GP_SERVICE_NAME: <+matrix.services.service_name>
+                          GP_WORKING_DIRECTORY: <+matrix.services.working_directory>
+                        command: |
+                          set -eu
+                          svc="${GP_SERVICE_NAME}"
+                          if [ "$svc" = "__none__" ]; then
+                            echo "npm stack not enabled for this run - nothing to do"
+                            exit 0
+                          fi
+                          cd "/harness/${GP_WORKING_DIRECTORY}"
+
+                          echo "=== testing ${svc} on pod $(hostname) ==="
+                          mkdir -p coverage
+                          npm test
+
+                          payload="/harness/.gp-handoff/npm/${svc}"
+                          mkdir -p "$payload"
+                          cp coverage/lcov.info "$payload/lcov.info"
+                          printf '%s' "$svc" > "$payload/MODULE"
+
+                          {
+                            echo "stack=npm"
+                            echo "service=${svc}"
+                            echo "pod=$(hostname)"
+                            echo "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                            echo "command=npm test"
+                          } > "$payload/BUILT_BY"
+
+                          {
+                            echo "sonar.sources=${GP_WORKING_DIRECTORY}/src"
+                            echo "sonar.tests=${GP_WORKING_DIRECTORY}/src"
+                            echo "sonar.test.inclusions=**/*.test.js"
+                            echo "sonar.exclusions=**/node_modules/**,**/coverage/**"
+                            echo "sonar.javascript.lcov.reportPaths=${payload}/lcov.info"
+                          } > "$payload/sonar.contrib"
+
+                          echo "=== payload staged for handoff ==="
+                          find "$payload" -maxdepth 1 | sort
+                          echo "=== lcov report ==="
+                          cat "$payload/lcov.info"
+                          echo "=== this stack's sonar contribution ==="
+                          cat "$payload/sonar.contrib"
+                  - step:
+                      type: SaveCacheS3
+                      name: save payload to s3
+                      identifier: save_npm_payload
+                      timeout: 15m
+                      spec:
+                        connectorRef: account.AWS_OIDC_S3_Connector_account
+                        region: us-west-2
+                        bucket: gp-sonar-handoff-664418987337
+                        key: handoff/<+pipeline.executionId>/npm/<+matrix.services.service_name>
+                        sourcePaths:
+                          - /harness/.gp-handoff/npm/<+matrix.services.service_name>
+                        archiveFormat: Tar
+                        override: true
+                      when:
+                        stageStatus: Success
+                        condition: '<+matrix.services.service_name> != "__none__"'
+            strategy:
+              matrix:
+                services: <+json.list("services", <+pipeline.stages.prepare.spec.execution.steps.detect_services.output.outputVariables.npm_matrix>)>
+                maxConcurrency: 2
+            when:
+              pipelineStatus: Success
+              condition: '<+pipeline.stages.prepare.spec.execution.steps.detect_services.output.outputVariables.npm_detected> == "true"'
+
+        - stage:
+            name: go
+            identifier: go
+            type: CI
+            description: Real Go build. Produces a coverprofile, then saves it to S3.
+            spec:
+              cloneCodebase: true
+              caching:
+                enabled: false
+              platform:
+                os: Linux
+                arch: Amd64
+              runtime:
+                type: Cloud
+                spec: {}
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: go test
+                      identifier: go_test
+                      timeout: 15m
+                      spec:
+                        shell: Sh
+                        image: golang:1.22-alpine
+                        envVariables:
+                          GP_SERVICE_NAME: <+matrix.services.service_name>
+                          GP_WORKING_DIRECTORY: <+matrix.services.working_directory>
+                        command: |
+                          set -eu
+                          svc="${GP_SERVICE_NAME}"
+                          if [ "$svc" = "__none__" ]; then
+                            echo "go stack not enabled for this run - nothing to do"
+                            exit 0
+                          fi
+                          cd "/harness/${GP_WORKING_DIRECTORY}"
+
+                          echo "=== testing ${svc} on pod $(hostname) ==="
+                          go vet ./...
+                          go test -covermode=atomic -coverprofile=coverage.out ./...
+                          go tool cover -func=coverage.out
+
+                          payload="/harness/.gp-handoff/go/${svc}"
+                          mkdir -p "$payload"
+                          cp coverage.out "$payload/coverage.out"
+                          printf '%s' "$svc" > "$payload/MODULE"
+
+                          {
+                            echo "stack=go"
+                            echo "service=${svc}"
+                            echo "pod=$(hostname)"
+                            echo "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+                            echo "command=go test -covermode=atomic -coverprofile=coverage.out ./..."
+                          } > "$payload/BUILT_BY"
+
+                          {
+                            echo "sonar.sources=${GP_WORKING_DIRECTORY}"
+                            echo "sonar.tests=${GP_WORKING_DIRECTORY}"
+                            echo "sonar.test.inclusions=**/*_test.go"
+                            echo "sonar.go.coverage.reportPaths=${payload}/coverage.out"
+                          } > "$payload/sonar.contrib"
+
+                          echo "=== payload staged for handoff ==="
+                          find "$payload" -maxdepth 1 | sort
+                          echo "=== coverprofile ==="
+                          cat "$payload/coverage.out"
+                          echo "=== this stack's sonar contribution ==="
+                          cat "$payload/sonar.contrib"
+                  - step:
+                      type: SaveCacheS3
+                      name: save payload to s3
+                      identifier: save_go_payload
+                      timeout: 15m
+                      spec:
+                        connectorRef: account.AWS_OIDC_S3_Connector_account
+                        region: us-west-2
+                        bucket: gp-sonar-handoff-664418987337
+                        key: handoff/<+pipeline.executionId>/go/<+matrix.services.service_name>
+                        sourcePaths:
+                          - /harness/.gp-handoff/go/<+matrix.services.service_name>
+                        archiveFormat: Tar
+                        override: true
+                      when:
+                        stageStatus: Success
+                        condition: '<+matrix.services.service_name> != "__none__"'
+            strategy:
+              matrix:
+                services: <+json.list("services", <+pipeline.stages.prepare.spec.execution.steps.detect_services.output.outputVariables.go_matrix>)>
+                maxConcurrency: 2
+            when:
+              pipelineStatus: Success
+              condition: '<+pipeline.stages.prepare.spec.execution.steps.detect_services.output.outputVariables.go_detected> == "true"'
+
+    # ------------------------------------------------------------------
+    # 3. sonar - one analysis, one project, one gate. Restores the build
+    #    output instead of regenerating it.
+    # ------------------------------------------------------------------
+    - stage:
+        name: sonar
+        identifier: sonar
+        type: CI
+        description: Restores every module payload that actually arrived, then runs exactly one sonar-scanner analysis against a real SonarQube server. No build tool runs in this stage.
+        spec:
+          cloneCodebase: true
+          caching:
+            enabled: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              # A real SonarQube server, for the lifetime of this stage.
+              # - the image's launcher resolves lib/sonarqube.jar relatively,
+              #   and Harness starts background containers in the stage
+              #   workspace, so it has to cd into SONARQUBE_HOME first
+              # - the embedded Elasticsearch refuses to run as root and wants a
+              #   raised vm.max_map_count, neither of which a CI container
+              #   controls: runAsUser 1000 and allow_mmap=false sidestep both
+              # - portBindings is what makes it reachable on localhost:9000
+              #   from the steps that run on the VM host rather than in a
+              #   container; container steps reach it as http://sonarqube:9000,
+              #   i.e. by this step's identifier
+              - step:
+                  type: Background
+                  name: sonarqube server
+                  identifier: sonarqube
+                  spec:
+                    image: sonarqube:community
+                    shell: Sh
+                    command: |
+                      cd "${SONARQUBE_HOME:-/opt/sonarqube}"
+                      echo "starting SonarQube from $(pwd) as uid $(id -u)"
+                      if [ -x ./docker/entrypoint.sh ]; then
+                        exec ./docker/entrypoint.sh
+                      elif [ -x ./bin/run.sh ]; then
+                        exec ./bin/run.sh
+                      else
+                        exec java -jar lib/sonarqube.jar
+                      fi
+                    runAsUser: "1000"
+                    portBindings:
+                      "9000": "9000"
+                    envVariables:
+                      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+                      SONAR_SEARCH_JAVAADDITIONALOPTS: -Dnode.store.allow_mmap=false
+
+              # The dynamic stage input: one restore per module prepare
+              # actually found. failIfKeyNotFound false means a stack that did
+              # not run, or whose build failed, is simply absent rather than
+              # fatal. This is the step that the generic SaveCache/RestoreCache
+              # could not do in parallel-stage form - many keys, one consumer.
+              - step:
+                  type: RestoreCacheS3
+                  name: restore built module
+                  identifier: restore_module
+                  timeout: 15m
+                  spec:
+                    connectorRef: account.AWS_OIDC_S3_Connector_account
+                    region: us-west-2
+                    bucket: gp-sonar-handoff-664418987337
+                    key: handoff/<+pipeline.executionId>/<+matrix.modules.stack>/<+matrix.modules.service_name>
+                    archiveFormat: Tar
+                    failIfKeyNotFound: false
+                  strategy:
+                    matrix:
+                      modules: <+json.list("modules", <+pipeline.stages.prepare.spec.execution.steps.detect_services.output.outputVariables.all_modules>)>
+                      maxConcurrency: 1
+
+              - step:
+                  type: Run
+                  name: assemble sonar inputs
+                  identifier: assemble
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      GP_SONAR_PROJECT_KEY: <+pipeline.variables.GP_SONAR_PROJECT_KEY>
+                      GP_PROJECT_VERSION: <+pipeline.sequenceId>
+                      GP_MODULES_DETECTED: <+pipeline.stages.prepare.spec.execution.steps.detect_services.output.outputVariables.module_count>
+                    command: |
+                      set -eu
+                      share=/harness/.gp-handoff
+                      props=/harness/.sonar-generated.properties
+
+                      echo "=== this pod: $(hostname) ==="
+                      echo
+
+                      if [ ! -d "$share" ]; then
+                        echo "nothing arrived from any build stage - no analysis to run"
+                        exit 1
+                      fi
+
+                      echo "=== what actually arrived over the stage boundary ==="
+                      find "$share" -mindepth 2 -maxdepth 2 -type d | sort | sed 's/^/    /'
+                      echo "    total restored size: $(du -sh "$share" | cut -f1)"
+                      echo
+
+                      echo "=== provenance: built in a different pod, earlier ==="
+                      for b in $(find "$share" -name BUILT_BY | sort); do
+                        echo "    --- $b"
+                        sed 's/^/        /' "$b"
+                      done
+                      echo
+
+                      echo "=== Java bytecode SonarQube needs, restored not rebuilt ==="
+                      find "$share" -name '*.class' | sort | sed 's/^/    /'
+                      echo
+                      echo "=== resolved dependency jars, restored not re-resolved ==="
+                      find "$share" -name '*.jar' | sort | sed 's/^/    /'
+                      echo
+                      echo "=== coverage reports, restored not regenerated ==="
+                      find "$share" \( -name 'jacoco.xml' -o -name 'lcov.info' -o -name 'coverage.out' \) \
+                        -exec ls -l {} \; | sed 's/^/    /'
+                      echo
+
+                      # One properties file, aggregated from each stack's own
+                      # contribution. Repeated keys are joined with commas and
+                      # de-duplicated. sonar.modules is deprecated; this flat
+                      # model is the replacement - one project, many source
+                      # roots. The sonar step holds zero per-stack knowledge.
+                      contribs=$(find "$share" -name sonar.contrib | sort)
+                      if [ -z "$contribs" ]; then
+                        echo "no stack contributions arrived - nothing to analyse"
+                        exit 1
+                      fi
+
+                      all=/tmp/contrib.all
+                      cat $contribs > "$all"
+
+                      : > "$props"
+                      {
+                        echo "sonar.projectKey=${GP_SONAR_PROJECT_KEY}"
+                        echo "sonar.projectName=gp-sonar-demo"
+                        echo "sonar.projectVersion=${GP_PROJECT_VERSION}"
+                        echo "sonar.sourceEncoding=UTF-8"
+                        echo "sonar.scm.disabled=true"
+                        echo "sonar.qualitygate.wait=true"
+                        echo "sonar.qualitygate.timeout=600"
+                      } >> "$props"
+
+                      for k in $(cut -d= -f1 "$all" | awk '!seen[$0]++'); do
+                        v=$(grep "^${k}=" "$all" | cut -d= -f2- | awk '!seen[$0]++' | paste -sd, -)
+                        printf '%s=%s\n' "$k" "$v" >> "$props"
+                      done
+
+                      # The analysed set is derived from what is on disk, so it
+                      # is exactly the set that built - not the set that was
+                      # hoped for. A module that was expected but did not
+                      # arrive is excluded rather than scanned empty, which
+                      # would report 0% coverage and fail the gate for a wrong
+                      # reason.
+                      mods=""
+                      for d in "$share"/*/*; do
+                        [ -f "$d/MODULE" ] || continue
+                        mods="${mods}${mods:+,}$(cat "$d/MODULE")"
+                      done
+
+                      module_count=0
+                      for m in $(printf '%s' "$mods" | tr ',' ' '); do
+                        module_count=$((module_count + 1))
+                      done
+                      modules_scanned="$mods"
+
+                      echo "=== dynamic module list ==="
+                      echo "    detected by prepare : ${GP_MODULES_DETECTED}"
+                      echo "    arrived and scanned : ${module_count}  [${mods}]"
+                      if [ "${GP_MODULES_DETECTED}" != "${module_count}" ]; then
+                        missing=$((GP_MODULES_DETECTED - module_count))
+                        echo "    note: ${missing} module(s) did not arrive, and are therefore"
+                        echo "          excluded from the analysis rather than scanned empty."
+                      fi
+                      echo
+                      echo "=== aggregated analysis properties ==="
+                      sed 's/^/    /' "$props"
+                    outputVariables:
+                      - name: modules_scanned
+                      - name: module_count
+
+              - step:
+                  type: Run
+                  name: sonar bootstrap
+                  identifier: sonar_bootstrap
+                  timeout: 15m
+                  spec:
+                    shell: Sh
+                    command: |
+                      set -eu
+                      host=http://localhost:9000
+
+                      # The Background step is marked successful as soon as the
+                      # container starts and its exit code is ignored, so this
+                      # health check is the only thing that proves the server
+                      # is actually up.
+                      echo "waiting for the SonarQube server to report UP"
+                      i=0
+                      status=""
+                      while [ "$status" != "UP" ]; do
+                        i=$((i + 1))
+                        if [ "$i" -gt 120 ]; then
+                          echo "SonarQube did not come up in time; last status='${status}'"
+                          exit 1
+                        fi
+                        sleep 5
+                        status=$(curl -fsS "$host/api/system/status" 2>/dev/null \
+                          | sed -n 's/.*"status":"\([A-Z]*\)".*/\1/p' || true)
+                        if [ -n "$status" ]; then
+                          echo "  [$i] status=$status"
+                        fi
+                      done
+                      echo "SonarQube is UP, version $(curl -fsS "$host/api/server/version")"
+
+                      # A real server, so a real credential. The default admin
+                      # password has to be rotated before the API will issue a
+                      # token, exactly as on a permanent instance.
+                      sonar_admin_password="Gp-Handoff-$(date +%s)-Aa1"
+                      curl -fsS -u admin:admin -X POST \
+                        "$host/api/users/change_password?login=admin&previousPassword=admin&password=${sonar_admin_password}" \
+                        >/dev/null
+                      echo "rotated the admin password"
+
+                      sonar_token=$(curl -fsS -u "admin:${sonar_admin_password}" -X POST \
+                        "$host/api/user_tokens/generate?name=gp-handoff-$(date +%s)" \
+                        | sed -n 's/.*"token":"\([^"]*\)".*/\1/p')
+                      if [ -z "$sonar_token" ]; then
+                        echo "could not mint an analysis token"
+                        exit 1
+                      fi
+                      echo "minted a real analysis token (${#sonar_token} chars)"
+                    outputVariables:
+                      - name: sonar_token
+                      - name: sonar_admin_password
+
+              - step:
+                  type: Run
+                  name: sonar scanner
+                  identifier: sonar_scan
+                  timeout: 30m
+                  spec:
+                    shell: Sh
+                    image: sonarsource/sonar-scanner-cli:11
+                    envVariables:
+                      SONAR_TOKEN: <+execution.steps.sonar_bootstrap.output.outputVariables.sonar_token>
+                      GP_ENFORCEMENT: <+pipeline.variables.GP_ENFORCEMENT>
+                    command: |
+                      set -eu
+                      cd /harness
+
+                      # The strongest available proof that nothing is rebuilt
+                      # here: this container has no build toolchain. It does
+                      # ship a JDK and Node, because the Java and JavaScript
+                      # analyzers need them to PARSE - but gradle, mvn and go
+                      # are absent and no build command is invoked.
+                      echo "=== build tools available in the sonar stage ==="
+                      for tool in gradle mvn javac npm node go; do
+                        if command -v "$tool" >/dev/null 2>&1; then
+                          echo "    PRESENT $tool"
+                        else
+                          echo "    absent  $tool"
+                        fi
+                      done
+                      echo
+
+                      # sonar.qualitygate.wait=true in the generated properties
+                      # is what makes the gate meaningful - without it the
+                      # scanner exits 0 regardless of the gate result.
+                      rc=0
+                      sonar-scanner \
+                        -Dproject.settings=/harness/.sonar-generated.properties \
+                        -Dsonar.host.url=http://sonarqube:9000 \
+                        -Dsonar.token="${SONAR_TOKEN}" || rc=$?
+
+                      gate=PASSED
+                      [ "$rc" -eq 0 ] || gate=FAILED
+                      echo
+                      echo "=== quality gate: ${gate} (scanner exit ${rc}) ==="
+
+                      if [ "$rc" -ne 0 ]; then
+                        case "${GP_ENFORCEMENT}" in
+                          fail)
+                            echo "failing the build (GP_ENFORCEMENT=fail)"
+                            exit 1
+                            ;;
+                          warn)
+                            echo "not failing the build (GP_ENFORCEMENT=warn)"
+                            ;;
+                          off)
+                            echo "enforcement disabled (GP_ENFORCEMENT=off)"
+                            ;;
+                        esac
+                      fi
+                    outputVariables:
+                      - name: gate
+
+              # The server dies with the stage, so the dashboard is not
+              # available afterwards - this step is the record.
+              - step:
+                  type: Run
+                  name: sonar results
+                  identifier: sonar_results
+                  timeout: 10m
+                  spec:
+                    shell: Sh
+                    envVariables:
+                      SONAR_TOKEN: <+execution.steps.sonar_bootstrap.output.outputVariables.sonar_token>
+                      GP_SONAR_PROJECT_KEY: <+pipeline.variables.GP_SONAR_PROJECT_KEY>
+                    command: |
+                      set -eu
+                      host=http://localhost:9000
+                      key="${GP_SONAR_PROJECT_KEY}"
+
+                      echo "=== quality gate conditions, straight from the server ==="
+                      curl -fsS -u "${SONAR_TOKEN}:" \
+                        "$host/api/qualitygates/project_status?projectKey=${key}" \
+                        | jq -r '.projectStatus | "    overall: \(.status)", (.conditions[] | "    \(.status)  \(.metricKey)  actual=\(.actualValue)  threshold \(.comparator) \(.errorThreshold)")'
+                      echo
+
+                      echo "=== project measures ==="
+                      curl -fsS -u "${SONAR_TOKEN}:" \
+                        "$host/api/measures/component?component=${key}&metricKeys=ncloc,coverage,lines_to_cover,uncovered_lines,tests,bugs,vulnerabilities,code_smells,duplicated_lines_density" \
+                        | jq -r '.component.measures | sort_by(.metric)[] | "    \(.metric)=\(.value)"'
+                      echo
+
+                      echo "=== per-directory coverage, proving each stack's report was imported ==="
+                      curl -fsS -u "${SONAR_TOKEN}:" \
+                        "$host/api/measures/component_tree?component=${key}&metricKeys=ncloc,coverage,uncovered_lines&qualifiers=DIR&strategy=all&ps=100" \
+                        | jq -r '.components[] | . as $c | "    \($c.path // $c.name): " + ([$c.measures[]? | "\(.metric)=\(.value)"] | sort | join("  "))'
+                      echo
+
+                      echo "=== issues found on the restored code and bytecode ==="
+                      curl -fsS -u "${SONAR_TOKEN}:" \
+                        "$host/api/issues/search?components=${key}&ps=25" \
+                        | jq -r '.issues[]? | "    [\(.severity)] \(.rule)  \(.component | split(":") | last):\(.line // 0)  \(.message)"'
+                      echo
+                      echo "NOTE: this SonarQube server is ephemeral - it exists only for the"
+                      echo "      lifetime of this stage, so the output above is the record."

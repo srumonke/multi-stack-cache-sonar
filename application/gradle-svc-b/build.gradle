@@ -1,0 +1,35 @@
+plugins {
+    id 'java'
+    id 'jacoco'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.10.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+
+test {
+    useJUnitPlatform()
+    finalizedBy jacocoTestReport
+}
+
+jacocoTestReport {
+    dependsOn test
+    reports {
+        xml.required = true
+        html.required = false
+    }
+}
+
+// Exports the resolved dependency jars into the build directory so a later
+// stage can hand SonarQube's Java analyzer a real classpath without resolving
+// dependencies, or touching the network, a second time.
+tasks.register('exportSonarLibs', Copy) {
+    from configurations.testRuntimeClasspath
+    into layout.buildDirectory.dir('sonar-libs')
+}
