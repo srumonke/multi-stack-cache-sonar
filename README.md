@@ -579,7 +579,16 @@ Then run it. Pipeline variables:
 
 ## 8. Verified results
 
-From run 4 (`kWsGIkXBR_KxHIvdzEf8Nw`) — Success end to end.
+Two runs are quoted below, both Success end to end:
+
+- **run 4** (`kWsGIkXBR_KxHIvdzEf8Nw`) — the mechanism itself, with the services
+  at the repo root.
+- **the layout run** (`AS0FlxZ-S42-6MHR9Vt4lQ`) — the same pipeline with
+  `GP_APP_ROOT=application`, confirming the `application/` layout in this repo
+  changes nothing but the source paths.
+
+Both produced **identical** measures — 73.2% coverage, 85 ncloc, 7 tests, 1 bug,
+quality gate PASSED — so the layout is verifiably not load-bearing.
 
 ### Four pods, four images, overlapping in time
 
@@ -626,8 +635,20 @@ sonar.go.coverage.reportPaths=/harness/.gp-handoff/go/go-api/coverage.out
 ```
 
 Comma-joined and de-duplicated by a step that knows nothing about any of the
-three stacks. (Source paths shown as in run 4, which ran with the services at
-the repo root; with `GP_APP_ROOT=application` they are prefixed accordingly.)
+three stacks.
+
+The source paths above are from run 4, which ran with the services at the repo
+root. With `GP_APP_ROOT=application` — the layout in this repo — the same step
+produced:
+
+```properties
+sonar.sources=application/go-api,application/gradle-svc-a/src/main/java,application/gradle-svc-b/src/main/java,application/npm-web/src
+sonar.tests=application/go-api,application/gradle-svc-a/src/test/java,application/gradle-svc-b/src/test/java,application/npm-web/src
+```
+
+Note that the **payload** paths (`/harness/.gp-handoff/...`) are unchanged by
+`GP_APP_ROOT`, and correctly so: those are staging locations inside the pod, not
+repo paths. Only `sonar.sources` and `sonar.tests` are repo-relative.
 
 ### The gate
 
@@ -656,6 +677,14 @@ go-api:                                  coverage=75.0  ncloc=26
 gradle-svc-a/src/main/java/com/kyriba/a: coverage=70.0  ncloc=19
 gradle-svc-b/src/main/java/com/kyriba/b: coverage=58.3  ncloc=26
 npm-web/src:                             coverage=88.0  ncloc=14
+```
+
+And from the layout run, the same numbers under the `application/` tree:
+
+```
+application:                   coverage=73.2  ncloc=85  uncovered_lines=13
+application/go-api:            coverage=75.0  ncloc=26  uncovered_lines=3
+application/gradle-svc-a/src:  coverage=70.0  ncloc=19  uncovered_lines=3
 ```
 
 Three analysers ran, Java via ECJ against the **restored bytecode**:
